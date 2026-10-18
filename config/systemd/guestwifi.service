@@ -1,0 +1,17 @@
+[Unit]
+Description=Gast-WLAN Verwaltung
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/astrobridge/app
+EnvironmentFile=/etc/astroBridge/default.env
+ExecStart=/opt/astrobridge/venv/bin/python3 /opt/astrobridge/app/guest-wifi.py
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

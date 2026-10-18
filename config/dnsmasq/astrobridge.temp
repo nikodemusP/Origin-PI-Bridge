@@ -1,0 +1,23 @@
+# Nur auf diesen Interfaces lauschen
+interface=br0
+
+# Sicherstellen, dass dnsmasq nicht an andere Interfaces bindet
+bind-interfaces
+
+# DHCP-Bereich für das Brücken-Netzwerk (Beispiel für  @ORIGIN_NETWORK_CLASS_C@.x)
+# Verteilt IPs von .50 bis .100 mit einer Lease-Time von 12 Stunden
+dhcp-range= @ORIGIN_NETWORK_CLASS_C@.50, @ORIGIN_NETWORK_CLASS_C@.100,255.255.255.0,12h
+
+# Den Standard-Gateway (Router) für die Clients setzen
+# Das ist die IP Ihrer Brücke, da diese den Internet-Traffic zu wlan1 weiterleitet
+dhcp-option=option:router, @ORIGIN_NETWORK_CLASS_C@.1
+
+# Den DNS-Server für die Clients setzen
+# Option 1: Die Astrobridge selbst (falls dnsmasq als DNS-Forwarder arbeitet)
+dhcp-option=option:dns-server, @ORIGIN_NETWORK_CLASS_C@.1
+# Option 2 (Alternativ/Sicherer): Direkt öffentliche DNS-Server mitgeben (z.B. Google & Cloudflare)
+dhcp-option=option:dns-server,8.8.8.8,1.1.1.1
+
+# Optional: Dem Celestron-Teleskop immer dieselbe IP zuweisen (Static Lease)
+# Ersetzen Sie die MAC-Adresse mit der Ihres Teleskops (aus 'ip a' oder 'arp' ersichtlich)
+dhcp-host=@ORIGIN_MAC_LAN@,celestron-origin, @ORIGIN_IP@,infinite
