@@ -9,30 +9,50 @@ from datetime import datetime
 
 app = Flask(__name__)
 
-# Alles per Umgebungsvariable überschreibbar, damit das Script auf jedem Gerät läuft:
-#   GUEST_WIFI_IFACE  WLAN-Schnittstelle (Standard: automatisch, bevorzugt wlan0)
-#   GUEST_WIFI_HOST   Bind-Adresse        (Standard: 0.0.0.0 = alle Schnittstellen)
-#   GUEST_WIFI_PORT   Port                (Standard: 8080)
-#   GUEST_WIFI_WG_CONF WireGuard-Config   (Standard: /etc/wireguard/wg0.conf)
-#   GUEST_WIFI_LEASES  dnsmasq-Leasefile  (Standard: /var/lib/misc/dnsmasq.leases)
-#   GUEST_WIFI_ORIGIN  Hostname des Origin-Geräts (Standard: origin)
+# Everything can be overridden via environment variables so the script runs on any device:
+#   GUEST_WIFI_IFACE        Wi-Fi interface (default: auto-detect, prefers wlan0)
+#   GUEST_WIFI_HOST         Bind address    (default: 0.0.0.0 = all interfaces)
+#   GUEST_WIFI_PORT         Port            (default: 8080)
+#   GUEST_WIFI_WG_CONF      WireGuard config (default: /etc/wireguard/wg0.conf)
+#   GUEST_WIFI_LEASES       dnsmasq lease file (default: /var/lib/misc/dnsmasq.leases)
+#   ORIGIN_MAC_LAN         MAC of the Origin device (from default.env)
+#   ORIGIN_IP              Fixed IP of the Origin device (from default.env)
+#   GUEST_WIFI_ORIGIN       Extra hostname(s) of the Origin device, comma-separated
+#                           (default: origin,celestron-origin)
+#   GUEST_WIFI_HIDE_SSIDS   Comma-separated SSIDs that are never shown
+#                           (in addition to the automatically detected own Wi-Fi)
+#   GUEST_WIFI_HOSTAPD_CONF hostapd config used to detect the own SSID
+#                           (default: /etc/hostapd/hostapd.conf)
 WLAN_IFACE = os.environ.get("GUEST_WIFI_IFACE", "").strip() or "wlan0"
 BIND_HOST = os.environ.get("GUEST_WIFI_HOST", "0.0.0.0")
 PORT = int(os.environ.get("GUEST_WIFI_PORT", "8080"))
 
-REFRESH_INTERVAL = 10  # Sekunden
+REFRESH_INTERVAL = 10  # seconds
 
-VERSION = "6"
+VERSION = "8"
 WIFI_PROFILE_TYPES = {"wifi", "802-11-wireless"}
 LEASES_FILE = os.environ.get("GUEST_WIFI_LEASES", "/var/lib/misc/dnsmasq.leases")
-ORIGIN_HOST = os.environ.get("GUEST_WIFI_ORIGIN", "origin").strip().lower()
+ORIGIN_HOSTS = {
+    x.strip().lower()
+    for x in os.environ.get("GUEST_WIFI_ORIGIN", "origin,celestron-origin").split(",")
+    if x.strip()
+}
+ORIGIN_MAC = os.environ.get("ORIGIN_MAC_LAN", "").strip().strip("'\"").lower()
+ORIGIN_IP = os.environ.get("ORIGIN_IP", "").strip().strip("'\"")
 
-# WireGuard: Interface-Name ergibt sich aus dem Dateinamen (wg0.conf -> wg0)
+# Own Wi-Fi (broadcast by this device): hidden from the lists.
+HIDE_SSIDS = {
+    x.strip() for x in os.environ.get("GUEST_WIFI_HIDE_SSIDS", "").split(",") if x.strip()
+}
+HOSTAPD_CONF = os.environ.get("GUEST_WIFI_HOSTAPD_CONF", "/etc/hostapd/hostapd.conf")
+OWN_SSIDS_AUTO = set()  # filled by get_profiles() from AP/bridge profiles
+
+# WireGuard: the interface name is derived from the file name (wg0.conf -> wg0)
 WG_CONF = os.environ.get("GUEST_WIFI_WG_CONF", "/etc/wireguard/wg0.conf")
 WG_IFACE = os.path.splitext(os.path.basename(WG_CONF))[0]
 WG_LOCK = threading.Lock()
 
-# Bridge-Slave-Profile wie "br0-wlan0" sollen nicht als gespeichertes WLAN erscheinen.
+# Bridge slave profiles such as "br0-wlan0" must not show up as saved Wi-Fi networks.
 BRIDGE_NAME_RE = re.compile(r"^br\d+-")
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
@@ -103,7 +123,7 @@ def get_current():
     ])
 
     if result.returncode != 0:
-        return "Nicht verbunden"
+        return "Not connected"
 
     value = result.stdout.strip()
     if value.startswith("GENERAL.CONNECTION:"):
@@ -112,7 +132,7 @@ def get_current():
     value = nmcli_unescape(value)
 
     if not value or value == "--":
-        return "Nicht verbunden"
+        return "Not connected"
 
     return value
 
@@ -139,35 +159,54 @@ def get_signal():
     return None
 
 
-def is_client_profile(name, uuid):
-    """True nur für normale WLAN-Client-Profile.
+def inspect_profile(name, uuid):
+    """Inspects a Wi-Fi profile. Returns (is_client_profile, ssid).
 
-    Ausgeschlossen werden Bridge-Profile (Name br0-*), Profile die einer
-    Bridge/einem Master zugeordnet sind und Access-Point-/Ad-hoc-Profile.
+    Not client profiles: bridge profiles (name br0-*), profiles assigned to a
+    bridge/master and access point / ad-hoc profiles. Their SSID is the own
+    Wi-Fi and is hidden from the lists.
     """
-    if BRIDGE_NAME_RE.match(name):
-        return False
+    bridge_name = bool(BRIDGE_NAME_RE.match(name))
 
     result = run_command([
         "nmcli", "-t", "-e", "yes", "-g",
-        "802-11-wireless.mode,connection.master,connection.slave-type",
+        "802-11-wireless.mode,connection.master,connection.slave-type,802-11-wireless.ssid",
         "connection", "show", "uuid", uuid,
     ])
     if result.returncode != 0:
-        return True  # im Zweifel anzeigen (Namensfilter hat schon gegriffen)
+        return (not bridge_name), ""  # when in doubt, show it
 
     lines = [nmcli_unescape(l).strip() for l in result.stdout.split("\n")]
-    lines += [""] * (3 - len(lines))
-    mode, master, slave_type = (v if v != "--" else "" for v in lines[:3])
+    lines += [""] * (4 - len(lines))
+    mode, master, slave_type, ssid = (v if v != "--" else "" for v in lines[:4])
 
+    is_client = not bridge_name
     if mode and mode != "infrastructure":
-        return False
+        is_client = False
     if master or slave_type:
-        return False
-    return True
+        is_client = False
+    return is_client, ssid
+
+
+def get_own_ssids():
+    """SSIDs of the own Wi-Fi: from AP/bridge profiles, hostapd and the environment variable."""
+    own = set(OWN_SSIDS_AUTO) | HIDE_SSIDS
+    try:
+        with open(HOSTAPD_CONF, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith(("ssid=", "ssid2=")) and not line.startswith("ssid2=P"):
+                    value = line.split("=", 1)[1].strip().strip('"')
+                    if value:
+                        own.add(value)
+    except OSError:
+        pass
+    return own
 
 
 def get_profiles():
+    global OWN_SSIDS_AUTO
+
     result = run_command([
         "nmcli", "-t", "-e", "yes",
         "-f", "NAME,UUID,TYPE,DEVICE",
@@ -177,7 +216,8 @@ def get_profiles():
     if result.returncode != 0:
         return []
 
-    profiles = []
+    candidates = []
+    own_auto = set()
 
     for line in result.stdout.splitlines():
         parts = split_nmcli_line(line)
@@ -189,47 +229,89 @@ def get_profiles():
         if conn_type not in WIFI_PROFILE_TYPES:
             continue
 
-        if not is_client_profile(name, uuid):
+        is_client, ssid = inspect_profile(name, uuid)
+        if not is_client:
+            if ssid:
+                own_auto.add(ssid)
             continue
 
-        profiles.append({
+        candidates.append({
             "name": name,
             "uuid": uuid,
             "device": device,
             "active": device == WLAN_IFACE,
         })
 
-    return profiles
+    OWN_SSIDS_AUTO = own_auto
+    own = get_own_ssids()
+
+    # Do not offer the own Wi-Fi (unless it is actually connected right now).
+    return [p for p in candidates if p["active"] or p["name"] not in own]
 
 
-def get_origin_ip():
-    """IP des Origin-Geräts aus den dnsmasq-Leases (Format:
-    <ablauf> <mac> <ip> <hostname> <client-id>). Bei Mehrfachtreffern gewinnt
-    der Lease mit der spätesten Ablaufzeit. None, wenn nicht gefunden."""
-    best_ip, best_expiry = None, -1
+def find_origin_ip():
+    """IP of the Origin device. Looked up in the dnsmasq leases by MAC address,
+    fixed IP or hostname (format: <expiry> <mac> <ip> <hostname> <client-id>).
+    With multiple matches the lease with the latest expiry wins. Falls back to
+    ORIGIN_IP from the configuration. None if unknown."""
+    best_ip, best_rank = None, -1
     now = time.time()
     try:
         with open(LEASES_FILE, encoding="utf-8", errors="replace") as fh:
             for line in fh:
                 parts = line.split()
-                if len(parts) < 4 or parts[3].lower() != ORIGIN_HOST:
+                if len(parts) < 4:
+                    continue
+                matches = (
+                    (ORIGIN_MAC and parts[1].lower() == ORIGIN_MAC)
+                    or (ORIGIN_IP and parts[2] == ORIGIN_IP)
+                    or parts[3].lower() in ORIGIN_HOSTS
+                )
+                if not matches:
                     continue
                 try:
                     expiry = int(parts[0])
                 except ValueError:
                     continue
                 if expiry != 0 and expiry < now:
-                    continue  # abgelaufen (0 = unbegrenzt)
+                    continue  # expired (0 = unlimited)
                 rank = float("inf") if expiry == 0 else expiry
-                if rank > best_expiry:
-                    best_ip, best_expiry = parts[2], rank
+                if rank > best_rank:
+                    best_ip, best_rank = parts[2], rank
     except OSError:
-        return None
-    return best_ip
+        pass
+    return best_ip or ORIGIN_IP or None
+
+
+def is_host_present(ip):
+    """True if the host answers right now: ping first, then the ARP/neighbor
+    table (covers hosts that block ICMP but still answer ARP)."""
+    try:
+        ping = run_command(["ping", "-n", "-c", "1", "-W", "1", ip], timeout=4)
+        if ping.returncode == 0:
+            return True
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+    try:
+        neigh = run_command(["ip", "neigh", "show", ip], timeout=4)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    for line in neigh.stdout.splitlines():
+        words = line.split()
+        if "lladdr" in words and words[-1] in {"REACHABLE", "DELAY", "PROBE", "PERMANENT"}:
+            return True
+    return False
+
+
+def get_origin():
+    """Origin status: {"ip": str|None, "connected": bool}."""
+    ip = find_origin_ip()
+    return {"ip": ip, "connected": bool(ip) and is_host_present(ip)}
 
 
 def wg_cmd(*args):
-    """Stellt sudo -n voran, wenn das Script nicht als root läuft."""
+    """Prepends sudo -n when the script is not running as root."""
     cmd = list(args)
     if hasattr(os, "geteuid") and os.geteuid() != 0:
         cmd = ["sudo", "-n", *cmd]
@@ -239,14 +321,14 @@ def wg_cmd(*args):
 def format_age(seconds):
     seconds = int(seconds)
     if seconds < 60:
-        return f"vor {seconds} s"
+        return f"{seconds} s ago"
     if seconds < 3600:
-        return f"vor {seconds // 60} min"
-    return f"vor {seconds // 3600} h"
+        return f"{seconds // 60} min ago"
+    return f"{seconds // 3600} h ago"
 
 
 def get_wireguard():
-    """Status von WireGuard: konfiguriert?, aktiv?, letzter Handshake (best effort)."""
+    """WireGuard status: configured?, active?, last handshake (best effort)."""
     info = {
         "iface": WG_IFACE,
         "conf": WG_CONF,
@@ -260,7 +342,7 @@ def get_wireguard():
     except FileNotFoundError:
         info["configured"] = False
     except OSError:
-        pass  # z. B. keine Leserechte auf /etc/wireguard -> unbekannt, also ok
+        pass  # e.g. no read permission on /etc/wireguard -> unknown, so assume ok
 
     if info["active"]:
         try:
@@ -280,7 +362,7 @@ def get_wireguard():
 
 
 def get_networks(rescan=True):
-    """Liefert Liste der Access Points, bei Fehler None."""
+    """Returns the list of access points, None on error."""
     result = run_command([
         "nmcli", "-t", "-e", "yes",
         "-f", "SSID,SIGNAL,SECURITY,DEVICE",
@@ -293,6 +375,7 @@ def get_networks(rescan=True):
         return None
 
     best = {}
+    own_ssids = get_own_ssids()
 
     for line in result.stdout.splitlines():
         parts = split_nmcli_line(line)
@@ -302,6 +385,9 @@ def get_networks(rescan=True):
         ssid, signal, security, device = parts[:4]
 
         if device != WLAN_IFACE or not ssid:
+            continue
+
+        if ssid in own_ssids:
             continue
 
         try:
@@ -327,7 +413,7 @@ def get_networks(rescan=True):
 
 
 def detect_wlan_iface():
-    """Nimmt GUEST_WIFI_IFACE, sonst wlan0 falls vorhanden, sonst das erste WLAN-Device."""
+    """Uses GUEST_WIFI_IFACE, else wlan0 if present, else the first Wi-Fi device."""
     forced = os.environ.get("GUEST_WIFI_IFACE", "").strip()
     if forced:
         return forced
@@ -344,18 +430,18 @@ def detect_wlan_iface():
 
 
 # ---------------------------------------------------------------------
-# Zustands-Cache: wird beim Start und danach alle REFRESH_INTERVAL
-# Sekunden im Hintergrund aktualisiert. Die Webseite liest nur den Cache
-# und ist dadurch sofort da (kein Scan pro Seitenaufruf).
+# State cache: refreshed at startup and then every REFRESH_INTERVAL
+# seconds in the background. The web page only reads the cache and is
+# therefore instant (no scan per page view).
 # ---------------------------------------------------------------------
 STATE_LOCK = threading.Lock()
 SCAN_LOCK = threading.RLock()
 STATE = {
-    "current": "Nicht verbunden",
+    "current": "Not connected",
     "signal": None,
     "profiles": [],
     "networks": [],
-    "origin_ip": None,
+    "origin": {"ip": None, "connected": False},
     "wireguard": {
         "iface": WG_IFACE, "conf": WG_CONF,
         "configured": True, "active": False, "handshake": None,
@@ -371,15 +457,15 @@ def refresh_state(rescan=True):
         profiles = get_profiles()
         networks = get_networks(rescan=rescan)
     wireguard = get_wireguard()
-    origin_ip = get_origin_ip()
+    origin = get_origin()
 
     with STATE_LOCK:
         STATE["current"] = current
         STATE["signal"] = signal
         STATE["profiles"] = profiles
         STATE["wireguard"] = wireguard
-        STATE["origin_ip"] = origin_ip
-        if networks is not None:  # bei Scan-Fehler alte Liste behalten
+        STATE["origin"] = origin
+        if networks is not None:  # keep the old list on scan errors
             STATE["networks"] = networks
         STATE["updated"] = datetime.now().strftime("%H:%M:%S")
 
@@ -395,7 +481,7 @@ def refresher_loop():
         try:
             refresh_state()
         except Exception as exc:  # Thread darf nie sterben
-            print(f"[{datetime.now():%H:%M:%S}] Aktualisierung fehlgeschlagen: {exc}", flush=True)
+            print(f"[{datetime.now():%H:%M:%S}] Refresh failed: {exc}", flush=True)
         time.sleep(max(1.0, REFRESH_INTERVAL - (time.monotonic() - started)))
 
 
@@ -403,12 +489,12 @@ def initial_phase():
     started = datetime.now()
     print(f"GUEST_WIFI_app Version {VERSION}", flush=True)
     print(
-        f"[{started:%H:%M:%S}] Initialphase gestartet: lese aktuelles WLAN "
-        f"und scanne Access Points auf {WLAN_IFACE} ...",
+        f"[{started:%H:%M:%S}] Initial phase started: reading current Wi-Fi "
+        f"and scanning access points on {WLAN_IFACE} ...",
         flush=True,
     )
 
-    # Direkt nach dem Boot ist der erste Scan oft leer -> bis zu 3 Versuche.
+    # Right after boot the first scan is often empty -> up to 3 attempts.
     for attempt in range(3):
         refresh_state()
         if get_state()["networks"]:
@@ -420,34 +506,37 @@ def initial_phase():
     state = get_state()
     duration = (finished - started).total_seconds()
 
-    print(f"[{finished:%H:%M:%S}] Initialphase beendet (Dauer: {duration:.1f} s).", flush=True)
-    print(f"  Schnittstelle:  {WLAN_IFACE}", flush=True)
-    print(f"  Aktuelles WLAN: {state['current']}", flush=True)
+    print(f"[{finished:%H:%M:%S}] Initial phase finished (took {duration:.1f} s).", flush=True)
+    print(f"  Interface:      {WLAN_IFACE}", flush=True)
+    print(f"  Current Wi-Fi:  {state['current']}", flush=True)
     wg = state["wireguard"]
-    print(f"  Origin-IP:      {state['origin_ip'] or 'nicht gefunden'}", flush=True)
-    wg_text = "aktiv" if wg["active"] else "inaktiv"
+    origin = state["origin"]
+    origin_text = origin["ip"] or "not found"
+    origin_text += " (connected)" if origin["connected"] else " (not connected)"
+    print(f"  Origin:         {origin_text}", flush=True)
+    wg_text = "active" if wg["active"] else "inactive"
     if not wg["configured"]:
-        wg_text += f" (Config {wg['conf']} fehlt)"
+        wg_text += f" (config {wg['conf']} missing)"
     print(f"  WireGuard ({wg['iface']}): {wg_text}", flush=True)
 
     if state["profiles"]:
-        print(f"  Gespeicherte WLANs ({len(state['profiles'])}):", flush=True)
+        print(f"  Saved Wi-Fi networks ({len(state['profiles'])}):", flush=True)
         for prof in state["profiles"]:
-            mark = "  <- verbunden" if prof["active"] else ""
+            mark = "  <- connected" if prof["active"] else ""
             print(f"    - {prof['name']}{mark}", flush=True)
     else:
-        print("  Gespeicherte WLANs: keine", flush=True)
+        print("  Saved Wi-Fi networks: none", flush=True)
 
     if state["networks"]:
-        print(f"  Gefundene WLANs ({len(state['networks'])}):", flush=True)
+        print(f"  Networks found ({len(state['networks'])}):", flush=True)
         for net in state["networks"]:
-            sec = net["security"].strip() or "offen"
+            sec = net["security"].strip() or "open"
             print(f"    - {net['ssid']}  ({net['signal']} %, {sec})", flush=True)
     else:
-        print("  Gefundene WLANs: keine", flush=True)
+        print("  Networks found: none", flush=True)
 
     print(
-        f"  Weitere Aktualisierung alle {REFRESH_INTERVAL} s. "
+        f"  Next refresh every {REFRESH_INTERVAL} s. "
         f"Web-UI: http://{BIND_HOST}:{PORT}",
         flush=True,
     )
@@ -472,7 +561,7 @@ def index():
         profiles=state["profiles"],
         networks=state["networks"],
         wg=state["wireguard"],
-        origin_ip=state["origin_ip"],
+        origin=state["origin"],
         updated=state["updated"],
         error=request.args.get("error"),
         success=request.args.get("success"),
@@ -484,9 +573,9 @@ def connect_profile():
     uuid = request.form.get("uuid", "").strip()
 
     if not UUID_RE.fullmatch(uuid):
-        return error_redirect("Ungültige WLAN-Profil-ID")
+        return error_redirect("Invalid Wi-Fi profile ID")
 
-    with SCAN_LOCK:  # kein Hintergrund-Scan während des Verbindens
+    with SCAN_LOCK:  # no background scan while connecting
         result = run_command([
             "nmcli",
             "connection",
@@ -498,26 +587,52 @@ def connect_profile():
         ], timeout=45)
 
     if result.returncode != 0:
-        error = result.stderr.strip() or result.stdout.strip() or "Verbindung fehlgeschlagen"
+        error = result.stderr.strip() or result.stdout.strip() or "Connection failed"
         return error_redirect(error)
 
     refresh_state(rescan=False)
-    return success_redirect("Gespeichertes WLAN wurde aktiviert.")
+    return success_redirect("Saved Wi-Fi network activated.")
+
+
+@app.post("/delete-profile")
+def delete_profile():
+    uuid = request.form.get("uuid", "").strip()
+
+    if not UUID_RE.fullmatch(uuid):
+        return error_redirect("Invalid Wi-Fi profile ID")
+
+    with SCAN_LOCK:
+        # Only delete profiles that are shown in the list (no bridges etc.).
+        profile = next((p for p in get_profiles() if p["uuid"] == uuid), None)
+        if profile is None:
+            return error_redirect("Profile not found or cannot be deleted.")
+
+        result = run_command(
+            ["nmcli", "connection", "delete", "uuid", uuid], timeout=30
+        )
+
+    if result.returncode != 0:
+        error = result.stderr.strip() or result.stdout.strip() or "Delete failed"
+        return error_redirect(error)
+
+    print(f"[{datetime.now():%H:%M:%S}] Profile deleted: {profile['name']} ({uuid})", flush=True)
+    refresh_state(rescan=False)
+    return success_redirect(f"Wi-Fi profile “{profile['name']}” deleted.")
 
 
 @app.post("/wireguard")
 def wireguard_toggle():
     action = request.form.get("action", "")
     if action not in ("up", "down"):
-        return error_redirect("Ungültige WireGuard-Aktion")
+        return error_redirect("Invalid WireGuard action")
 
     with WG_LOCK:
         try:
             result = run_command(wg_cmd("wg-quick", action, WG_CONF), timeout=45)
         except FileNotFoundError:
-            return error_redirect("wg-quick nicht gefunden (Paket wireguard-tools installieren).")
+            return error_redirect("wg-quick not found (install the wireguard-tools package).")
         except subprocess.TimeoutExpired:
-            return error_redirect("WireGuard: Zeitüberschreitung.")
+            return error_redirect("WireGuard: timed out.")
 
     out = (result.stderr.strip() or result.stdout.strip()).replace("\n", " | ")
     print(
@@ -526,17 +641,17 @@ def wireguard_toggle():
     )
 
     if result.returncode != 0:
-        lines = (result.stderr.strip() or result.stdout.strip() or "unbekannter Fehler").splitlines()
+        lines = (result.stderr.strip() or result.stdout.strip() or "unknown error").splitlines()
         return error_redirect("WireGuard: " + " | ".join(lines[-3:])[:300])
 
     refresh_state(rescan=False)
     return success_redirect(
-        "WireGuard wurde aktiviert." if action == "up" else "WireGuard wurde deaktiviert."
+        "WireGuard activated." if action == "up" else "WireGuard deactivated."
     )
 
 
 def log_nmcli(step, args, result):
-    """Protokolliert jeden Verbindungsschritt auf der Konsole (Passwort maskiert)."""
+    """Logs every connection step to the console (password masked)."""
     shown = []
     for i, a in enumerate(args):
         shown.append("***" if i > 0 and args[i - 1].endswith(".psk") else a)
@@ -555,7 +670,7 @@ def nmcli_step(step, args, timeout=30):
 
 
 def list_wifi_profiles(ssid):
-    """UUIDs aller WLAN-Profile, die so heißen wie die SSID (auch 'SSID 1' usw.)."""
+    """UUIDs of all Wi-Fi profiles named like the SSID (also 'SSID 1' etc.)."""
     uuids = []
     for line in nmcli_terse("NAME,UUID,TYPE", "connection", "show"):
         parts = split_nmcli_line(line)
@@ -570,7 +685,7 @@ def list_wifi_profiles(ssid):
 
 
 def security_mode(security):
-    """Leitet aus der nmcli-SECURITY-Spalte die Verschlüsselungsart ab."""
+    """Derives the encryption type from the nmcli SECURITY column."""
     sec = security.upper()
     if "802.1X" in sec:
         return "enterprise"
@@ -582,10 +697,10 @@ def security_mode(security):
 
 
 def create_and_activate(ssid, sec_args):
-    """Entfernt alte/kaputte Profile gleichen Namens, legt das Profil komplett
-    neu an (inkl. key-mgmt) und aktiviert es. Gibt Fehlermeldung oder None zurück."""
+    """Removes old/broken profiles of the same name, creates the profile from
+    scratch (incl. key-mgmt) and activates it. Returns an error message or None."""
     for old_uuid in list_wifi_profiles(ssid):
-        nmcli_step("Altes Profil löschen", ["nmcli", "connection", "delete", "uuid", old_uuid])
+        nmcli_step("Delete old profile", ["nmcli", "connection", "delete", "uuid", old_uuid])
 
     add_args = [
         "nmcli", "connection", "add",
@@ -595,26 +710,26 @@ def create_and_activate(ssid, sec_args):
         "ssid", ssid,
         *sec_args,
     ]
-    result = nmcli_step("Profil anlegen", add_args)
+    result = nmcli_step("Create profile", add_args)
     if result.returncode != 0:
-        err = result.stderr.strip() or result.stdout.strip() or "unbekannter Fehler"
-        return f"Profil anlegen fehlgeschlagen: {err}"
+        err = result.stderr.strip() or result.stdout.strip() or "unknown error"
+        return f"Creating profile failed: {err}"
 
     uuids = list_wifi_profiles(ssid)
     if not uuids:
-        return "Profil wurde angelegt, aber nicht gefunden."
+        return "Profile was created but could not be found."
     uuid = uuids[0]
 
     result = nmcli_step(
-        "Profil aktivieren",
+        "Activate profile",
         ["nmcli", "connection", "up", "uuid", uuid, "ifname", WLAN_IFACE],
         timeout=45,
     )
     if result.returncode != 0:
-        err = result.stderr.strip() or result.stdout.strip() or "unbekannter Fehler"
-        # Nicht funktionierendes Profil (z. B. falsches Passwort) nicht liegen lassen.
-        nmcli_step("Profil verwerfen", ["nmcli", "connection", "delete", "uuid", uuid])
-        return f"Aktivieren fehlgeschlagen: {err}"
+        err = result.stderr.strip() or result.stdout.strip() or "unknown error"
+        # Do not leave a non-working profile (e.g. wrong password) behind.
+        nmcli_step("Discard profile", ["nmcli", "connection", "delete", "uuid", uuid])
+        return f"Activation failed: {err}"
 
     return None
 
@@ -623,11 +738,11 @@ def connect_secured(ssid, password, security):
     mode = security_mode(security)
 
     if mode == "enterprise":
-        return "Enterprise-WLANs (802.1X) werden hier nicht unterstützt."
+        return "Enterprise Wi-Fi networks (802.1X) are not supported here."
     if mode == "wep":
-        return "WEP-WLANs werden nicht unterstützt (unsicher)."
+        return "WEP networks are not supported (insecure)."
     if not (8 <= len(password) <= 63 or re.fullmatch(r"[0-9a-fA-F]{64}", password)):
-        return "Das WLAN-Passwort muss 8 bis 63 Zeichen lang sein."
+        return "The Wi-Fi password must be 8 to 63 characters long."
 
     return create_and_activate(ssid, [
         "802-11-wireless-security.key-mgmt", mode,
@@ -641,10 +756,10 @@ def connect_new():
     password = request.form.get("password", "")
 
     if not ssid:
-        return error_redirect("SSID fehlt")
+        return error_redirect("SSID is missing")
 
     if len(ssid) > 255:
-        return error_redirect("SSID ist zu lang")
+        return error_redirect("SSID is too long")
 
     def find_network():
         return next((n for n in get_state()["networks"] if n["ssid"] == ssid), None)
@@ -652,25 +767,25 @@ def connect_new():
     network = find_network()
 
     if network is None:
-        refresh_state()  # evtl. neu hinzugekommen -> einmal frisch scannen
+        refresh_state()  # may be new -> scan once more
         network = find_network()
 
     if network is None:
         return error_redirect(
-            f"WLAN '{ssid}' wurde beim Scan nicht gefunden."
+            f"Wi-Fi network '{ssid}' was not found during the scan."
         )
 
     security = network["security"].strip()
 
-    with SCAN_LOCK:  # kein Hintergrund-Scan während des Verbindens
+    with SCAN_LOCK:  # no background scan while connecting
         if security:
             if not password:
                 return error_redirect(
-                    "Für dieses WLAN wird ein Passwort benötigt."
+                    "A password is required for this network."
                 )
             error = connect_secured(ssid, password, security)
         else:
-            # Offenes WLAN: Profil ohne Security-Einstellungen.
+            # Open network: profile without security settings.
             error = create_and_activate(ssid, [])
 
     if error:
@@ -678,18 +793,18 @@ def connect_new():
 
     refresh_state(rescan=False)
     return success_redirect(
-        f"Mit '{ssid}' verbunden und als NetworkManager-Profil gespeichert."
+        f"Connected to '{ssid}' and saved as a NetworkManager profile."
     )
 
 
 TEMPLATE = r"""
 <!doctype html>
-<html lang="de">
+<html lang="en">
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
 
-    <title>Gast-WLAN Verwaltung</title>
+    <title>Guest Wi-Fi Management</title>
 
     <style>
         * {
@@ -828,6 +943,15 @@ TEMPLATE = r"""
             border-bottom: 1px solid #eaecf0;
         }
 
+        .profile-actions {
+            display: flex;
+            gap: 8px;
+        }
+
+        .profile-actions form {
+            margin: 0;
+        }
+
         .profile:last-child {
             border-bottom: 0;
         }
@@ -944,6 +1068,10 @@ TEMPLATE = r"""
             .wg button {
                 width: 100%;
             }
+
+            .profile-actions {
+                flex-direction: column;
+            }
         }
     </style>
 </head>
@@ -951,10 +1079,10 @@ TEMPLATE = r"""
 <body>
 <div class="container">
 
-    <h1>Gast-WLAN Verwaltung</h1>
+    <h1>Guest Wi-Fi Management</h1>
     <div class="subtitle">
-        Verwaltet <strong>{{ iface }}</strong> und WireGuard (<strong>{{ wg.iface }}</strong>).
-        Alle anderen Schnittstellen bleiben unangetastet.
+        Manages <strong>{{ iface }}</strong> and WireGuard (<strong>{{ wg.iface }}</strong>).
+        All other interfaces are left untouched.
     </div>
 
     {% if error %}
@@ -979,18 +1107,20 @@ TEMPLATE = r"""
                     {% if signal is not none %}
                         Signal: {{ signal }} %
                     {% else %}
-                        Kein WLAN-Signal verfügbar
+                        No Wi-Fi signal available
                     {% endif %}
                     {% if updated %}
-                        · Stand: {{ updated }}
+                        · Updated: {{ updated }}
                     {% endif %}
                 </div>
                 <div class="signal">
                     Origin:
-                    {% if origin_ip %}
-                        <strong>{{ origin_ip }}</strong>
+                    {% if origin.connected %}
+                        <strong>{{ origin.ip }}</strong>
+                        <span class="active"> · connected</span>
                     {% else %}
-                        nicht gefunden
+                        {% if origin.ip %}<strong>{{ origin.ip }}</strong> · {% endif %}
+                        <span class="wg-off">not connected</span>
                     {% endif %}
                 </div>
             </div>
@@ -998,7 +1128,7 @@ TEMPLATE = r"""
             <button
                 class="secondary"
                 onclick="window.location.reload()">
-                Aktualisieren
+                Refresh
             </button>
         </div>
     </div>
@@ -1011,20 +1141,20 @@ TEMPLATE = r"""
                 <div class="ssid" style="font-size:18px;">
                     {{ wg.iface }}
                     {% if not wg.configured %}
-                        <span class="wg-off"> · Config fehlt</span>
+                        <span class="wg-off"> · Config missing</span>
                     {% elif wg.active %}
-                        <span class="active"> · aktiv</span>
+                        <span class="active"> · active</span>
                     {% else %}
-                        <span class="wg-off"> · inaktiv</span>
+                        <span class="wg-off"> · inactive</span>
                     {% endif %}
                 </div>
                 <div class="signal">
                     {% if not wg.configured %}
-                        {{ wg.conf }} nicht gefunden
+                        {{ wg.conf }} not found
                     {% elif wg.active and wg.handshake %}
-                        Letzter Handshake {{ wg.handshake }}
+                        Last handshake {{ wg.handshake }}
                     {% elif wg.active %}
-                        Tunnel läuft · Config: {{ wg.conf }}
+                        Tunnel running · Config: {{ wg.conf }}
                     {% else %}
                         Config: {{ wg.conf }}
                     {% endif %}
@@ -1048,7 +1178,7 @@ TEMPLATE = r"""
     </div>
 
     <div class="card">
-        <h2>Gespeicherte WLANs</h2>
+        <h2>Saved Wi-Fi networks</h2>
 
         {% if profiles %}
             {% for profile in profiles %}
@@ -1057,31 +1187,47 @@ TEMPLATE = r"""
                         <strong>{{ profile.name }}</strong>
 
                         {% if profile.active %}
-                            <span class="active"> · verbunden</span>
+                            <span class="active"> · connected</span>
                         {% endif %}
                     </div>
 
-                    <form method="post" action="/connect-profile">
-                        <input
-                            type="hidden"
-                            name="uuid"
-                            value="{{ profile.uuid }}">
+                    <div class="profile-actions">
+                        <form method="post" action="/connect-profile">
+                            <input
+                                type="hidden"
+                                name="uuid"
+                                value="{{ profile.uuid }}">
 
-                        <button type="submit">
-                            Verbinden
-                        </button>
-                    </form>
+                            <button type="submit">
+                                Connect
+                            </button>
+                        </form>
+
+                        <form method="post" action="/delete-profile"
+                              onsubmit='return confirm(
+                                {{ ("Delete “" ~ profile.name ~ "”?" ~ (" This network is currently connected; the connection will be dropped." if profile.active else ""))|tojson }}
+                              )'>
+                            <input
+                                type="hidden"
+                                name="uuid"
+                                value="{{ profile.uuid }}">
+
+                            <button type="submit" class="danger">
+                                Delete
+                            </button>
+                        </form>
+                    </div>
                 </div>
             {% endfor %}
         {% else %}
             <div class="empty">
-                Noch keine gespeicherten WLAN-Profile gefunden.
+                No saved Wi-Fi profiles found.
             </div>
         {% endif %}
     </div>
 
     <div class="card">
-        <h2>Verfügbare WLANs</h2>
+        <h2>Available Wi-Fi networks</h2>
 
         {% if networks %}
             <div class="network-list">
@@ -1101,7 +1247,7 @@ TEMPLATE = r"""
                                 {% if network.security %}
                                     · {{ network.security }}
                                 {% else %}
-                                    · Offen
+                                    · Open
                                 {% endif %}
                             </div>
                         </div>
@@ -1112,20 +1258,20 @@ TEMPLATE = r"""
                                 {{ network.ssid|tojson }},
                                 {{ (network.security|length > 0)|tojson }}
                             )'>
-                            Verbinden
+                            Connect
                         </button>
                     </div>
                 {% endfor %}
             </div>
         {% else %}
             <div class="empty">
-                Keine WLANs gefunden.
+                No Wi-Fi networks found.
             </div>
         {% endif %}
     </div>
 
     <div class="card">
-        <h2>WLAN manuell hinzufügen</h2>
+        <h2>Add Wi-Fi network manually</h2>
 
         <form class="manual" method="post" action="/connect-new">
             <input
@@ -1138,11 +1284,11 @@ TEMPLATE = r"""
             <input
                 type="password"
                 name="password"
-                placeholder="Passwort (bei offenem WLAN leer lassen)"
+                placeholder="Password (leave empty for open networks)"
                 autocomplete="new-password">
 
             <button type="submit">
-                Speichern &amp; verbinden
+                Save &amp; connect
             </button>
         </form>
     </div>
@@ -1152,7 +1298,7 @@ TEMPLATE = r"""
 <div id="wifiModal" class="modal-backdrop">
     <div class="modal">
         <div class="modal-header">
-            <h2 id="modalTitle">WLAN verbinden</h2>
+            <h2 id="modalTitle">Connect to Wi-Fi</h2>
 
             <button
                 type="button"
@@ -1170,7 +1316,7 @@ TEMPLATE = r"""
 
             <div id="passwordArea">
                 <label for="modalPassword">
-                    WLAN-Passwort
+                    Wi-Fi password
                 </label>
 
                 <input
@@ -1178,12 +1324,12 @@ TEMPLATE = r"""
                     name="password"
                     type="password"
                     autocomplete="new-password"
-                    placeholder="Passwort">
+                    placeholder="Password">
             </div>
 
             <div id="openNetworkMessage"
                  style="display:none; margin-top:15px; color:#667085;">
-                Dieses WLAN ist offen. Es wird ohne Passwort gespeichert.
+                This network is open. It will be saved without a password.
             </div>
 
             <div class="modal-actions">
@@ -1191,11 +1337,11 @@ TEMPLATE = r"""
                     type="button"
                     class="secondary"
                     onclick="closeWifiModal()">
-                    Abbrechen
+                    Cancel
                 </button>
 
                 <button type="submit">
-                    Speichern &amp; verbinden
+                    Save &amp; connect
                 </button>
             </div>
         </form>
@@ -1211,7 +1357,7 @@ TEMPLATE = r"""
     const openNetworkMessage = document.getElementById("openNetworkMessage");
 
     function openWifiModal(ssid, secured) {
-        modalTitle.textContent = "Mit „" + ssid + "“ verbinden";
+        modalTitle.textContent = "Connect to “" + ssid + "”";
         modalSsid.value = ssid;
         modalPassword.value = "";
 
@@ -1249,14 +1395,14 @@ TEMPLATE = r"""
         }
     });
 
-    // Alte Meldungen (?error=/?success=) nach dem Anzeigen aus der URL entfernen,
-    // damit sie beim automatischen Neuladen nicht ewig stehen bleiben.
+    // Remove old messages (?error=/?success=) from the URL after showing them,
+    // so they do not stay forever on automatic reloads.
     if (window.location.search) {
         history.replaceState(null, "", window.location.pathname);
     }
 
-    // Alle 10 s neu laden - aber nicht, wenn der Nutzer gerade tippt
-    // oder der Dialog offen ist (sonst ginge das eingegebene Passwort verloren).
+    // Reload every 10 s - but not while the user is typing or the dialog
+    // is open (otherwise the entered password would be lost).
     setInterval(function() {
         const typing =
             modal.style.display === "flex" ||

@@ -4,7 +4,7 @@ set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SECRETS_FILE="${PROJECT_DIR}/config/astroBridge/default.env"
 
-die() { echo "FEHLER: $*" >&2; exit 1; }
+die() { echo "ERROR: $*" >&2; exit 1; }
 
 echo "========================================"
 echo " Astro Bridge Installer"
@@ -12,17 +12,17 @@ echo "========================================"
 echo
 
 if [[ "${EUID}" -ne 0 ]]; then
-    echo "Bitte ausführen mit:"
+    echo "Please run with:"
     echo "  sudo ${PROJECT_DIR}/install.sh"
     exit 1
 fi
 
 if [[ ! -f "${SECRETS_FILE}" ]]; then
-    echo "FEHLER: ${SECRETS_FILE} fehlt."
+    echo "ERROR: ${SECRETS_FILE} is missing."
     echo
-    echo "Bitte zuerst:"
+    echo "Please run first:"
     echo "  cp ${PROJECT_DIR}/secrets/default.env.example ${SECRETS_FILE}"
-    echo "und die echten Secrets eintragen."
+    echo "and fill in the real secrets."
     exit 1
 fi
 
@@ -39,7 +39,7 @@ required=(
 #    HOME_NETWORK_CLASS_C WG_NETWORK_CLASS_C WG_IFACE
 
 for v in "${required[@]}"; do
-    [[ -n "${!v:-}" ]] || die "${v} fehlt in ${SECRETS_FILE}"
+    [[ -n "${!v:-}" ]] || die "${v} is missing in ${SECRETS_FILE}"
 done
 
 install -d -m 0755 /etc/astroBridge
@@ -52,7 +52,7 @@ render() {
         content="${content//@${v}@/${!v}}"
     done
     if grep -qE '@[A-Z_]+@' <<<"${content}"; then
-        echo "FEHLER: Nicht ersetzte Platzhalter in ${src}:"
+        echo "ERROR: Unreplaced placeholders in ${src}:"
         grep -noE '@[A-Z_]+@' <<<"${content}"
         exit 1
     fi
@@ -60,7 +60,7 @@ render() {
 }
 
 #
-echo "[1/11] Systempakete installieren"
+echo "[1/11] Install system packages"
 apt-get update
 apt-get install -y \
     network-manager \
@@ -77,7 +77,7 @@ apt-get install -y \
 
 
 # --- Ip Forwarding --------------------------------------
-echo "[2/11] IPv4 Forwarding + Konfiguration"
+echo "[2/11] IPv4 forwarding + configuration"
 cat > /etc/sysctl.d/99-astro-bridge.conf <<'SYSCTL'
 net.ipv4.ip_forward=1
 SYSCTL
@@ -94,18 +94,18 @@ nmcli connection delete br0-wlan0 2>/dev/null || true
 nmcli connection delete br0 2>/dev/null || true
 
 # --- Create the bridge --------------------------------------
-echo "[4/11] Bridge br0 erstellen"
+echo "[4/11] Create bridge br0"
 nmcli connection add type bridge con-name br0 ifname br0
 nmcli connection modify br0 ipv4.addresses "${ORIGIN_NETWORK_CLASS_C}.1/24" ipv4.method manual
 
 # --- ETH0 --------------------------------------
-echo "[5/11] ETH0 konfigurieren"
+echo "[5/11] Configure ETH0"
 nmcli connection add type ethernet con-name br0-eth0 ifname eth0 master br0
 nmcli connection add type ethernet con-name br0-eth0 ifname eth0 master br0 connection.slave-type bridge
 nmcli connection modify br0-eth0 ipv4.method disabled ipv6.method ignore
 
 # --- Create the Hotspot WiFi network --------------------------------------
-echo "[6/11] Hotspot WiFi konfigurieren"
+echo "[6/11] Configure hotspot Wi-Fi"
 nmcli connection add type wifi ifname "${HOTSPOT_IFACE}" \
   con-name br0-wlan0 \
   master br0 \
@@ -123,17 +123,17 @@ nmcli connection add type wifi ifname "${HOTSPOT_IFACE}" \
   wifi-sec.group ccmp \
   wifi-sec.pmf optional
 
-echo "[7/11] Bridge und WiFi-Verbindungen aktivieren"
+echo "[7/11] Activate bridge and Wi-Fi connections"
 sudo nmcli connection up br0
 sudo nmcli connection up br0-eth0
 sudo nmcli connection up br0-wlan0
 
-echo "[8/11] Aktive Verbindungen anzeigen"
+echo "[8/11] Show active connections"
 nmcli connection show --active
 nmcli device status
 
 # --- Start the DNSMasq service --------------------------------------------
-echo "[9/11] dnsmasq (Hotspot + Origin)"
+echo "[9/11] dnsmasq (hotspot + Origin)"
 render "${PROJECT_DIR}/config/dnsmasq/astrobridge.temp" /etc/dnsmasq.d/astrobridge.conf
 chmod 0644 /etc/dnsmasq.d/astrobridge.conf
 dnsmasq --test
@@ -142,7 +142,7 @@ systemctl restart dnsmasq
 
 
 # --- Install the Hotspot Webserver (Flask) --------------------------------------
-echo "[10/11] GUEST_WIFI-Webseite installieren"
+echo "[10/11] Install GUEST_WIFI web page"
 install -d -m 0755 /opt/astrobridge/app
 install -m 0755 \
     "${PROJECT_DIR}/scripts/guest-wifi.py" \
@@ -162,13 +162,12 @@ systemctl daemon-reload
 systemctl enable guestwifi
 systemctl restart guestwifi
 
-# --- Post-Installation: Firewall-Regeln setzen --------------------------------------
-echo "[11/11] Post-Installation: Firewall-Regeln setzen"
+# --- Post-Installation: set firewall rules --------------------------------------
+echo "[11/11] Post-installation: set firewall rules"
 # Forward traffic to wlan1 (Internet Uplink)
 iptables -t nat -A POSTROUTING -o wlan1 -j MASQUERADE
-# WICHTIG: Traffic zwischen WireGuard (wg0) und der Brücke (br0) erlauben
+# IMPORTANT: allow traffic between WireGuard (wg0) and the bridge (br0)
 iptables -A FORWARD -i wg0 -o br0 -j ACCEPT
 iptables -A FORWARD -i br0 -o wg0 -m state --state RELATED,ESTABLISHED -j ACCEPT
-# Regeln dauerhaft speichern
+# Persist rules
 netfilter-persistent save
-
