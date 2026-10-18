@@ -139,4 +139,6 @@ To restart the web application after changing its installed configuration:
 sudo systemctl restart guestwifi
 ```
 
+## TODO
 
+- [ ] The Celestron-Origin Smart Mark 2 could not connect to the PI-5 if the WLAN is in WPA2/WPA3 Mode. Till now, could not figure out, where the issue is located
